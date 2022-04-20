@@ -404,7 +404,7 @@ class Manager:
 			out.write(control_byte.to_bytes(1, "little"))
 			out.write(to_write)
 
-		size = out.tell()
+		size = out.tell() - 4
 		out.seek(2)
 		out.write(size.to_bytes(2, "little"))
 		out.seek(0)
@@ -431,14 +431,19 @@ class Manager:
 
 			raw.seek(start)
 			repeat_me = raw.read(l)
-			test = b""
-			for _ in range(ceil(max_lookahead / l)):
-				test += repeat_me
-				if buffer.startswith(test[:max_lookahead]):
-					best_match_distance = l
-					best_match_length = len(test)
-				else:
-					break
+			test = repeat_me
+			repeat_me = tuple(x.to_bytes(1, "little") for x in repeat_me)
+			for nz in range(ceil(max_lookahead / l) - 1):
+				break2 = False
+				for b in (repeat_me if nz else (b"", *repeat_me)):
+					test += b
+					if buffer.startswith(test[:max_lookahead]):
+						best_match_distance = l
+						best_match_length = len(test)
+					else:
+						break2 = True
+						break
+				if break2: break
 
 		if best_match_length < max_lookahead and head > best_match_length:
 			raw.seek(max(0, head - window_size))
