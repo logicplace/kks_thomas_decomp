@@ -1,0 +1,45 @@
+---
+using:
+  rom: Kikansha Thomas - Sodor-tou no Nakama-tachi (Japan).gbc
+  md5: 1a0aac7a746e247879d6b970bf9a9f32
+
+tables:
+  unknown:
+    start: 0x10c7
+    entries:
+      - unk1
+      - unk2
+      - unk3
+      - unk4
+      - unk5
+      - unk6
+      - unk7
+      - unk8
+      - unk9
+      - unk10
+      - unk11
+  addressed:
+    # Function at ROM0:1048 bases here for some reason
+    start: 0x10dd
+    entries:
+      - unk1
+      - unk2
+      - unk3
+      - unk4
+      - name: title_screen.png
+        addressing: 8800
+        palette:
+          - [0x59C0, 0x001F, 0x039F, 0x7FFF]
+          - [0x48C2, 0x001F, 0x039F, 0x7FFF]
+          - [0x48C2, 0x001F, 0x039F, 0x2F20]
+          - [0x48C2, 0x001F, 0x421F, 0x7FFF]
+          - [0x48C2, 0x6F7B, 0x2F20, 0x039F]
+          - [0x48C2, 0x6F7B, 0x4F4D, 0x2F20]
+          - [0x7FFF, 0x001F, 0x2F20, 0x7FFF]
+          - [0x0000, 0x0000, 0x0000, 0x0000]
+      - unk6
+      - unk7
+      - unk8
+      - unk9
+      - unk10
+      - unk11
