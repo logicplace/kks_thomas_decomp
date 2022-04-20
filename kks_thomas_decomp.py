@@ -3,8 +3,9 @@ import sys
 import struct
 import argparse
 from io import BytesIO
-from pathlib import Path
+from math import ceil
 from typing import Any, Dict
+from pathlib import Path
 
 import yaml
 
@@ -84,14 +85,22 @@ def gb_palette_int_to_bytes(i: int):
 
 	return bytes((red, green, blue))
 
-class Decompressor:
-	def __init__(self, rom: str):
-		self.fd = open(rom, "rb")
+class Manager:
+	def __init__(self, rom: str, mode="rb"):
+		self.fd = None
+		try:
+			self.fd = open(rom, mode)
+		except FileNotFoundError:
+			if mode == "rb+":
+				self.fd = open(rom, "wb+")
+			else:
+				raise
 		self.table: Dict[str, Dict[int, int]] = {}
 		self.info: Dict[str, Dict[str, Any]] = {}
 
 	def __del__(self):
-		self.fd.close()
+		if self.fd is not None:
+			self.fd.close()
 
 	def clear_table(self):
 		self.table.clear()
@@ -150,21 +159,29 @@ class Decompressor:
 					f.write(f"{loc},0x{cptr:06x},0x{rptr:06x}\n")
 
 	def dump_all_data(self, folder: Path):
+		for name in self.table.keys():
+			self.dump_data(name, folder)
+
+	def dump_data(self, name: str, folder: Path):
 		folder.mkdir(parents=True, exist_ok=True)
-		for name, entries in self.table.items():
-			info = self.info[name]
-			if "." in name:
-				name, ext = name.split(".", 1)
-			else:
-				ext = "bin"
+		try:
+			entries = self.table[name]
+		except KeyError:
+			raise ProgramError(f"No table {name}") from None
 
-			p = folder / name
-			p.mkdir(exist_ok=True)
+		info = self.info[name]
+		if "." in name:
+			name, ext = name.split(".", 1)
+		else:
+			ext = "bin"
 
-			if ext == "bin":
-				self._dump_bins(entries, p)
-			elif ext == "png":
-				self._dump_png(info, entries, p)
+		p = folder / name
+		p.mkdir(exist_ok=True)
+
+		if ext == "bin":
+			self._dump_bins(entries, p)
+		elif ext == "png":
+			self._dump_png(info, entries, p)
 
 	def _dump_bins(self, entries: Dict[int, int], p: Path):
 		for rptr, cptr in entries.items():
@@ -350,18 +367,116 @@ class Decompressor:
 
 		return d_buffer
 
+	def compress(self, fd):
+		raw = BytesIO(fd.read())
+		len_raw = fd.tell()
+		out = BytesIO(struct.pack("<HH", len_raw, 0))
+		out.seek(0, 2)
+
+		data_remaining = True
+		while data_remaining:
+			control_byte = 0
+			to_write = b""
+			for mask in LSB_FIRST_BITMASKS:
+				res = self.findLongestMatch(raw)
+				if res:
+					# Found a pattern to compress, 0 to control byte
+					# Form 12-byte length and 4-byte count
+					off, l = res
+					if off:
+						lr = off - 1
+						rep = (lr & 0xff) | ((l - 3) << 8) | ((lr & 0xf00) << 4)
+						to_write += rep.to_bytes(2, "little")
+					else:
+						# Ended?
+						data_remaining = False
+						break
+				else:
+					# No pattern, write literal byte; 1 to control byte
+					b = raw.read(1)
+					if b:
+						control_byte |= mask
+						to_write += b
+					else:
+						data_remaining = False
+						break
+			# Commit
+			out.write(control_byte.to_bytes(1, "little"))
+			out.write(to_write)
+
+		size = out.tell()
+		out.seek(2)
+		out.write(size.to_bytes(2, "little"))
+		out.seek(0)
+		return out.read()
+
+	@staticmethod
+	def findLongestMatch(raw: BytesIO):
+		max_lookahead = 18 # 0x0f (max value) + 3 (minimum value)
+		window_size = 0xfff
+		head = raw.tell()
+		buffer = raw.read(max_lookahead)
+
+		max_lookahead = min(len(buffer), max_lookahead)
+
+		best_match_distance = 0
+		best_match_length = 0
+
+		# Check for head repetition. For example:
+		# 00 FF | 00 FF 00 FF -> back 2 copy 4
+		for l in range(1, max_lookahead):
+			start = head - l
+			if start < 0:
+				break
+
+			raw.seek(start)
+			repeat_me = raw.read(l)
+			test = b""
+			for _ in range(ceil(max_lookahead / l)):
+				test += repeat_me
+				if buffer.startswith(test[:max_lookahead]):
+					best_match_distance = l
+					best_match_length = len(test)
+				else:
+					break
+
+		if best_match_length < max_lookahead and head > best_match_length:
+			raw.seek(max(0, head - window_size))
+			c_buffer = raw.read(min(head, window_size))
+			len_c_buffer = len(c_buffer)
+			# Minimum number of bytes to copy is 3
+			for l in range(max_lookahead, best_match_length, -1):
+				idx = c_buffer.rfind(buffer[:l])
+				if idx >= 0:
+					best_match_distance = len_c_buffer - idx
+					best_match_length = l
+					break
+
+		if best_match_length >= 3:
+			raw.seek(head + best_match_length)
+			return best_match_distance, best_match_length
+		raw.seek(head)
+		return None
+
+	def write_to(self, offset: int, data: bytes):
+		self.fd.seek(offset)
+		self.fd.write(data)
+
 
 def main():
 	parser = argparse.ArgumentParser(
 		description="Decompress graphics from Kikanshi Thomas for GBC.")
 	parser.add_argument("--out", "-o", type=Path, default="",
 		help="Output file or folder.")
-	parser.add_argument("--decompress", "-d", type=sp_int, default="0",
-		help="Decompress a single binary block starting at this offset.")
-	parser.add_argument("--config", "-c", default="",
+	group = parser.add_mutually_exclusive_group()
+	group.add_argument("--decompress", "-d", action="append",
+		help=("Decompress resource(s)."
+			" Can be a table name, table.section, a numerical offset, or 'all'."))
+	group.add_argument("--compress", "-c", action="append",
+		help=("Compress resource(s)."
+			" Can be a table name, table.section, a numerical offset colon filename, or 'all'."))
+	parser.add_argument("--config", "-C", default="",
 		help="Specify the config file.")
-	parser.add_argument("--table", "-t", default="",
-		help="Extract the specified table. (Default: all)")
 	parser.add_argument("rom", type=Path, nargs="?", default="",
 		help="Kikanshi Thomas .GBC file. If unspecified, tries the name in the config.")
 
@@ -375,38 +490,83 @@ def main():
 		config: dict = yaml.safe_load(f)
 	
 	rom: Path = args.rom
-	if not rom.is_file():
+	if rom.is_dir():
 		rom /= config.get("using", {}).get("rom")
-	if not rom.is_file():
-		raise ProgramError("ROM filename must be specified.")
+		if rom.is_dir():
+			raise ProgramError("ROM filename must be specified.")
 
 	try:
-		decomp = Decompressor(rom)
+		manager = Manager(rom, "rb+" if args.compress else "rb")
 	except FileNotFoundError as err:
 		raise ProgramError(f"ROM not found: {err.filename}") from None
 
 	# TODO: check MD5
 
 	if args.decompress:
-		res = decomp.decompress(args.decompress)
-		out: Path = args.out
-		if out == Path():
-			out /= "out.bin"
+		decomp_arg: str
+		for decomp_arg in args.decompress:
+			try:
+				offset = sp_int(decomp_arg)
+			except ValueError:
+				if "." in decomp_arg:
+					table_name, section = decomp_arg.split(".", 1)
+				else:
+					table_name = None if decomp_arg == "all" else decomp_arg
+					section = None
+				for name, table in config.get("tables", {}).items():
+					if table_name and table_name != name:
+						continue
 
-		if out.suffix == ".bin":
-			with out.open("wb") as f:
-				f.write(res)
-		else:
-			raise ProgramError(f"Unknown output filetype {out.suffix}")
-	else:
-		for name, table in config.get("tables", {}).items():
-			if args.table and args.table != name:
-				continue
+					manager.clear_table()
+					manager.read_table(table["start"], table["entries"])
+					fn = args.out / name
+					if section:
+						manager.dump_data(section, fn)
+					else:
+						manager.dump_all_data()
+					manager.dump_table(args.out / f"{name}.csv")
+			else:
+				res = manager.decompress(offset)
+				out: Path = args.out
+				if out == Path():
+					out /= "out.bin"
 
-			decomp.clear_table()
-			decomp.read_table(table["start"], table["entries"])
-			decomp.dump_all_data(args.out / name)
-			decomp.dump_table(args.out / f"{name}.csv")
+				if out.suffix == ".bin":
+					with out.open("wb") as f:
+						f.write(res)
+				else:
+					raise ProgramError(f"Unknown output filetype {out.suffix}")
+	elif args.compress:
+		comp_arg: str
+		for comp_arg in args.compress:
+			if ":" in comp_arg:
+				# Raw compress/import
+				o, fn = comp_arg.split(":", 1)
+				try:
+					offset = sp_int(o)
+				except ValueError:
+					raise ProgramError(f"Bad offset {o}") from None
+
+				file_in = Path(fn)
+
+				if file_in.suffix != ".bin":
+					raise ProgramError(f"Cannot compress {file_in.suffix} files")
+
+				with file_in.open("rb") as f:
+					out = manager.compress(f)
+				manager.write_to(offset, out)
+			else:
+				raise ProgramError("Table-based compression unimplemented")
+				if "." in comp_arg:
+					table_name, section = comp_arg.split(".", 1)
+				else:
+					table_name = None if comp_arg == "all" else comp_arg
+					section = None
+				for name, table in config.get("tables", {}).items():
+					if table_name and table_name != name:
+						continue
+
+					# TODO:
 
 if __name__ == "__main__":
 	try:
